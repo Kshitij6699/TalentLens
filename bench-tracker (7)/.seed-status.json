@@ -1,0 +1,15 @@
+{
+  "status": "success",
+  "timestamp": "2026-10-12T15:34:14.125Z",
+  "triedPaths": [
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\assets",
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\src\\assets",
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\src\\db\\assets",
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\assets",
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\dist\\assets",
+    "C:\\Users\\manka\\Downloads\\Hackerrank\\assets"
+  ],
+  "resolvedEmployeePath": "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\assets\\Dashboard_source_bench_updated.xlsx",
+  "resolvedMentorPath": "C:\\Users\\manka\\Downloads\\Hackerrank\\Hackerrank\\bench-tracker (7)\\assets\\Mentors_list.xlsx",
+  "errorMessage": null
+}

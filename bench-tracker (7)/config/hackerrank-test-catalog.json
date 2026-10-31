@@ -1,0 +1,76 @@
+{
+  "tests": [
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Beginner",
+      "code": "B1"
+    },
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Beginner",
+      "code": "B2"
+    },
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Beginner",
+      "code": "B3"
+    },
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Intermediate",
+      "code": "I1"
+    },
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Intermediate",
+      "code": "I2"
+    },
+    {
+      "testId": "",
+      "experienceBand": "0-5",
+      "level": "Intermediate",
+      "code": "I3"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Beginner",
+      "code": "B1"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Beginner",
+      "code": "B2"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Beginner",
+      "code": "B3"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Intermediate",
+      "code": "I1"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Intermediate",
+      "code": "I2"
+    },
+    {
+      "testId": "",
+      "experienceBand": "5-10",
+      "level": "Intermediate",
+      "code": "I3"
+    }
+  ]
+}

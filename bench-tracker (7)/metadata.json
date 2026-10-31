@@ -1,0 +1,6 @@
+{
+  "name": "TalentLens",
+  "description": "An enterprise portal for bench candidates to coordinate and track HackerRank technical assessments, evaluate skill metrics, and manage deployment readiness status.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+/* Use the .dark class controlled by the app theme toggle (Tailwind CSS v4). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Elegant and clearly visible horizontal scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1; /* slate-300 */
+  border-radius: 9999px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #3f3f46; /* zinc-700 */
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8; /* slate-400 */
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #52525b; /* zinc-600 */
+}
+
+/* Ensure horizontal scrollbars are always explicitly visible on scroll containers */
+.overflow-x-auto {
+  scrollbar-color: #cbd5e1 transparent;
+  scrollbar-width: thin;
+}
+
+.dark .overflow-x-auto {
+  scrollbar-color: #3f3f46 transparent;
+  scrollbar-width: thin;
+}
