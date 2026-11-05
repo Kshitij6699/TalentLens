@@ -1,8 +1,5 @@
-import { createRequire } from 'node:module';
-
-const require = createRequire(import.meta.url);
-const { relations } = require('drizzle-orm');
-const { integer, pgTable, serial, text, timestamp, real, boolean } = require('drizzle-orm/pg-core');
+import { relations } from 'drizzle-orm';
+import { integer, pgTable, serial, text, timestamp, real, boolean } from 'drizzle-orm/pg-core';
 
 // Users table (for authentication & system authorization)
 export const users = pgTable('users', {

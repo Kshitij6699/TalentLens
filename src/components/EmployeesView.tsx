@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Employee, Mentor, STATUS_LABELS } from '../types.ts';
 import EmployeeDetailModal from './EmployeeDetailModal.tsx';
+import { createRequestHeaders } from '../utils/api.ts';
 
 const formatExperience = (value: number | string | null | undefined) => {
   const years = Number(value);
@@ -107,6 +108,7 @@ export default function EmployeesView({
   const [filterSkill, setFilterSkill] = useState('All');
   const [filterStatus, setFilterStatus] = useState('All');
   const [filterType, setFilterType] = useState('All');
+  const [filterReadiness, setFilterReadiness] = useState('All');
   const [selectedEmp, setSelectedEmp] = useState<Employee | null>(null);
 
   // Form states for Add/Edit
@@ -148,13 +150,7 @@ export default function EmployeesView({
       const fetchEligible = async () => {
         setLoadingEligibleMentors(true);
         try {
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'x-simulated-role': simulatedRole
-          };
-          if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-          }
+          const headers = createRequestHeaders(token, simulatedRole);
           const res = await fetch(`/api/employees/${formData.id}/eligible-mentors`, { headers });
           if (res.ok) {
             const data = await res.json();
@@ -281,35 +277,31 @@ export default function EmployeesView({
     const matchesSkill = filterSkill === 'All' || emp.skillGroup === filterSkill;
     const matchesStatus = filterStatus === 'All' || emp.status === filterStatus;
     const matchesType = filterType === 'All' || emp.employeeType === filterType;
+    const matchesReadiness = filterReadiness === 'All' || emp.interviewReadiness === filterReadiness;
 
-    return matchesSearch && matchesSkill && matchesStatus && matchesType;
+    return matchesSearch && matchesSkill && matchesStatus && matchesType && matchesReadiness;
   });
 
-  // Get status color (mandated: green = available, red = needs support, blue = interview ready, orange = in training)
+  // Get status color based on deployment and genuine candidate interview readiness
   const getStatusStyle = (emp: Employee) => {
-    if (emp.status === 'Interview Ready') return 'bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-900/40';
-    if (emp.status === 'Enrolled') return 'bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 border-indigo-200 dark:border-indigo-900/40';
-    switch (emp.classificationTier) {
-      case 'Needs Support':
-        return 'bg-red-50 dark:bg-red-950/20 text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/40';
-      case 'Client Ready':
-      case 'Interview Ready':
+    if (emp.status === 'Allocated' || (emp.currentProject && emp.currentProject !== 'Bench' && emp.currentProject !== '—')) {
+      return 'bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 border-purple-200 dark:border-purple-900/40';
+    }
+    switch (emp.interviewReadiness) {
+      case 'Ready for Interview':
         return 'bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-900/40';
-      case 'In Training':
-        return 'bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 border-indigo-200 dark:border-indigo-900/40';
-      case 'Allocated':
-        return 'bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 border-purple-200 dark:border-purple-900/40';
+      case 'Chakra Pending':
+        return 'bg-violet-50 dark:bg-violet-950/20 text-violet-600 dark:text-violet-400 border-violet-200 dark:border-violet-900/40';
+      case 'Assessment In Progress':
+        return 'bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-900/40';
+      case 'Assessment Failed':
+        return 'bg-rose-50 dark:bg-rose-950/20 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-900/40';
+      case 'Assessment Pending':
       default:
-        switch (emp.status) {
-          case 'Available':
-            return 'bg-zinc-50 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700';
-          case 'In Training':
-            return 'bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 border-indigo-200 dark:border-indigo-900/40';
-          case 'Allocated':
-            return 'bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 border-purple-200 dark:border-purple-900/40';
-          default:
-            return 'bg-zinc-50 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700';
+        if (emp.classificationTier === 'Needs Support') {
+          return 'bg-red-50 dark:bg-red-950/20 text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/40';
         }
+        return 'bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-900/40';
     }
   };
 
@@ -392,6 +384,20 @@ export default function EmployeesView({
             <option value="New Joiner">New Joiner</option>
             <option value="Lateral Entry">Lateral Entry</option>
           </select>
+
+          <select
+            id="filter-readiness-select"
+            value={filterReadiness}
+            onChange={(e) => setFilterReadiness(e.target.value)}
+            className="text-xs bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-200 dark:border-zinc-700/60 rounded-xl p-2.5 text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
+          >
+            <option value="All">All Readiness</option>
+            <option value="Ready for Interview">Ready for Interview</option>
+            <option value="Chakra Pending">Chakra Pending</option>
+            <option value="Assessment In Progress">In Progress</option>
+            <option value="Assessment Failed">Failed</option>
+            <option value="Assessment Pending">Assessment Pending</option>
+          </select>
         </div>
       </div>
 
@@ -413,7 +419,7 @@ export default function EmployeesView({
               <thead className="bg-zinc-50 dark:bg-zinc-800/60 text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
                 <tr>
                   <th className="px-4 py-3 font-bold">Candidate</th>
-                  <th className="px-4 py-3 font-bold">Status</th>
+                  <th className="px-4 py-3 font-bold">Interview Readiness</th>
                   <th className="px-4 py-3 font-bold">Experience</th>
                   <th className="px-4 py-3 font-bold">Role Focus</th>
                   <th className="px-4 py-3 font-bold">Mentor</th>
@@ -425,13 +431,8 @@ export default function EmployeesView({
               </thead>
               <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
                 {filteredList.map(emp => {
-                  const statusLabel = ['Enrolled', 'Interview Ready', 'Allocated'].includes(emp.status)
-                    ? (STATUS_LABELS[emp.status] || emp.status)
-                    : emp.classificationTier === 'Needs Support' ? 'Needs Support' :
-                      (emp.classificationTier === 'Client Ready' || emp.classificationTier === 'Interview Ready') ? 'Ready for Interview' :
-                      emp.classificationTier === 'Allocated' ? 'Deployed' :
-                      emp.classificationTier === 'In Training' ? 'In Training' :
-                      emp.classificationTier === 'N/A' ? 'Idle / Bench' : (STATUS_LABELS[emp.status] || emp.status);
+                  const isDeployed = emp.status === 'Allocated' || (emp.currentProject && emp.currentProject !== 'Bench' && emp.currentProject !== '—');
+                  const statusLabel = isDeployed ? 'Deployed' : (emp.interviewReadiness || 'Assessment Pending');
                   return (
                     <tr key={emp.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/30 transition-colors">
                       <td className="px-4 py-3">
@@ -442,8 +443,8 @@ export default function EmployeesView({
                         </button>
                       </td>
                       <td className="px-4 py-3 whitespace-nowrap">
-                        <span className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold ${getStatusStyle(emp)}`}>{statusLabel}</span>
-                        <span className="block mt-1 text-[10px] text-zinc-400">{emp.employeeType}</span>
+                        <span className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold ${getStatusStyle(emp)}`}>{statusLabel}</span>
+                        <span className="block mt-1 text-[10px] text-zinc-400">{isDeployed ? (emp.currentProject || 'Project') : (emp.currentProject === 'Bench' ? 'Bench' : emp.status)} • {emp.employeeType}</span>
                       </td>
                       <td className="px-4 py-3 whitespace-nowrap text-zinc-700 dark:text-zinc-300">{formatExperience(emp.yearsOfExperience)}</td>
                       <td className="px-4 py-3 whitespace-nowrap font-semibold text-indigo-600 dark:text-indigo-400">{emp.skillGroup || '—'}</td>

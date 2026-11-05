@@ -20,6 +20,7 @@ JS to render). Sanity-check field names with one curl/Postman call against
 your own token before trusting this wholesale.
 """
 
+import os
 import time
 from datetime import datetime
 
@@ -27,10 +28,10 @@ import requests
 
 BASE_URL = "https://www.hackerrank.com/x/api/v3"
 BASE_URL_V2 = "https://www.hackerrank.com/x/api/v2"
-API_TOKEN = "f847d2c07c2c0fccf7bab772cac98dff17c67ba4ddd83fcb89db1b9ffb533d72"
+API_TOKEN = os.environ.get("HACKERRANK_API_KEY", "YOUR_HACKERRANK_API_KEY")
 
 HEADERS = {
-    "Authorization": f"Bearer f847d2c07c2c0fccf7bab772cac98dff17c67ba4ddd83fcb89db1b9ffb533d72",
+    "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json",
 }
 
@@ -153,7 +154,9 @@ def get_report_pdf(test_id: str, candidate_id: str, out_path: str = "candidate_r
 
 if __name__ == "__main__":
     list_tests()
-    test_id, candidate_id = invite_candidate("easy", "kshitijmankar@kpmg.com", "Kshitij Mankar Testing")
+    test_email = os.environ.get("CANDIDATE_EMAIL", "candidate@example.com")
+    test_name = os.environ.get("CANDIDATE_NAME", "Sample Candidate")
+    test_id, candidate_id = invite_candidate("easy", test_email, test_name)
     result = poll_status(test_id, candidate_id)
     if result:
         get_report_pdf(test_id, candidate_id)

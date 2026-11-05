@@ -5,6 +5,8 @@ export interface User {
   role: 'admin' | 'manager' | 'mentor';
   name: string;
   createdAt?: string;
+  originalRole?: string;
+  isTestingMode?: boolean;
 }
 
 export interface Mentor {
@@ -64,6 +66,11 @@ export interface Employee {
   overallScore?: number | null;
   classificationTier?: 'Client Ready' | 'Interview Ready' | 'Allocated' | 'In Training' | 'Needs Support' | 'N/A';
   tierReasons?: string[];
+  interviewReadiness?: InterviewReadiness;
+  assessmentPath?: AssessmentPath;
+  readinessReasons?: string[];
+  canMarkReady?: boolean;
+  skipAudit?: AssessmentSkipAudit | null;
   consecutiveResourcesOverdueCount?: number;
   managerAttentionRequired?: boolean;
   resourcesOverdue?: boolean;
@@ -76,6 +83,20 @@ export interface Employee {
   mocks?: MockInterview[];
   hackerrankExams?: HackerRankExam[];
   chakraInterviews?: ChakraInterview[];
+}
+
+export type AssessmentPath = 'hackerrank' | 'chakra' | 'both' | 'skip';
+export type InterviewReadiness =
+  | 'Ready for Interview'
+  | 'Assessment Pending'
+  | 'Assessment In Progress'
+  | 'Assessment Failed'
+  | 'Chakra Pending';
+
+export interface AssessmentSkipAudit {
+  skippedBy: string;
+  skippedAt: string;
+  reason?: string;
 }
 
 export interface HackerRankExam {
@@ -194,6 +215,10 @@ export interface DashboardStats {
     interviewReady: number;
     needsSupport: number;
     benchAlerts: number;
+    deployed?: number;
+    enrolled?: number;
+    idle?: number;
+    clientReady?: number;
   };
   skillStrength: {
     Python: number;

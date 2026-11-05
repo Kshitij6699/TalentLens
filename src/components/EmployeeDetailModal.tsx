@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { 
   X, Play, User, RefreshCw, CheckCircle2, ExternalLink, Upload, Bot
 } from 'lucide-react';
-import { Employee, STATUS_LABELS, ChakraInterview } from '../types.ts';
+import { Employee, STATUS_LABELS, ChakraInterview, AssessmentPath } from '../types.ts';
+import { createRequestHeaders, createJsonHeaders } from '../utils/api.ts';
 
 type AssessmentExperienceBand = '0-5' | '5-10';
 type AssessmentDifficulty = 'Beginner' | 'Intermediate';
@@ -103,19 +104,33 @@ const getAssessmentReportUrl = (rawResponse?: string | null): string | null => {
 };
 
 const getAssessmentCompletionDate = (exam: any): string => {
+  if (!exam) return '—';
+  const status = String(exam.status ?? '').trim().toLowerCase();
+
+  // Rule: Only a confirmed assessment completion event may display a completion timestamp.
+  // For Invited, In Progress, Pending, Expired, Cancelled, Failed, etc., display '—'.
+  if (status !== 'completed') {
+    return '—';
+  }
+
   const candidate = getRawCandidate(exam.rawResponse);
-  const data = parseExamResponse(exam.rawResponse);
+
+  // Rule: Only an actual completion timestamp from the candidate record or confirmed completion event.
+  // Never fall back to invitation creation, sync timestamp (lastSyncedAt), or record creation time.
   const value = exam.completedAt ?? candidate?.completed_at ?? candidate?.completedAt ?? candidate?.submitted_at ??
-    candidate?.finished_at ?? candidate?.date_completed ?? candidate?.test_completed_at ?? data?.completionConfirmedAt ?? data?.lastSyncedAt ?? null;
-  if (!value) return String(exam.status) === 'Completed' ? 'Completed · time not returned' : '—';
+    candidate?.finished_at ?? candidate?.date_completed ?? candidate?.test_completed_at ?? null;
+
+  if (!value) return '—';
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(exam.status) === 'Completed' ? 'Completed · time not returned' : '—';
-  const formatted = date.toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
-  const completionSource = String(data?.completionTimestampSource ?? '');
-  if (completionSource.includes('during sync')) return `${formatted} · confirmed at sync`;
-  if (completionSource.includes('during recruiter review')) return `${formatted} · confirmed during review`;
-  if (completionSource.includes('from webhook')) return `${formatted} · confirmed by webhook`;
-  return formatted;
+  if (Number.isNaN(date.getTime())) return '—';
+
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 };
 
 const toFiniteNumber = (value: unknown): number | null => {
@@ -317,6 +332,11 @@ export default function EmployeeDetailModal({
   const [isMarkingReady, setIsMarkingReady] = useState(false);
   const [statusOverride, setStatusOverride] = useState<string | null>(null);
 
+  const [assessmentPath, setAssessmentPath] = useState<AssessmentPath>(employee.assessmentPath || 'hackerrank');
+  const [isUpdatingPath, setIsUpdatingPath] = useState(false);
+  const [pathMessage, setPathMessage] = useState('');
+  const [pathError, setPathError] = useState('');
+
   const [chakraConfig, setChakraConfig] = useState<{ inviteLinkConfigured: boolean; apiSyncConfigured: boolean; apiSyncNote?: string } | null>(null);
   const [isPreparingChakra, setIsPreparingChakra] = useState(false);
   const [isSyncingChakraId, setIsSyncingChakraId] = useState<number | null>(null);
@@ -353,8 +373,7 @@ export default function EmployeeDetailModal({
       for (const exam of activeExams) {
         if (cancelled) return;
         try {
-          const headers: Record<string, string> = { 'x-simulated-role': simulatedRole };
-          if (token) headers.Authorization = `Bearer ${token}`;
+          const headers = createRequestHeaders(token, simulatedRole);
           const response = await fetch(`/api/employees/${employee.id}/hackerrank/sync/${exam.id}`, { method: 'POST', headers });
           if (response.ok) refreshed = true;
         } catch (error) {
@@ -372,8 +391,7 @@ export default function EmployeeDetailModal({
     let cancelled = false;
     const loadChakraConfig = async () => {
       try {
-        const headers: Record<string, string> = { 'x-simulated-role': simulatedRole };
-        if (token) headers.Authorization = `Bearer ${token}`;
+        const headers = createRequestHeaders(token, simulatedRole);
         const response = await fetch('/api/chakra/config', { headers });
         const data = await readApiJson(response);
         if (response.ok && !cancelled) setChakraConfig(data);
@@ -391,8 +409,7 @@ export default function EmployeeDetailModal({
       setIsLoadingTests(true);
       setTestListError('');
       try {
-        const headers: Record<string, string> = { 'x-simulated-role': simulatedRole };
-        if (token) headers.Authorization = `Bearer ${token}`;
+        const headers = createRequestHeaders(token, simulatedRole);
         const response = await fetch('/api/hackerrank/tests', { headers });
         const data = await readApiJson(response);
         if (!response.ok) throw new Error(data.error || 'Unable to load HackerRank tests.');
@@ -417,11 +434,7 @@ export default function EmployeeDetailModal({
     try {
       const selectedTest = availableTests.find((test) => test.id === selectedTestId);
       if (!selectedTest) throw new Error('Select a HackerRank test before triggering an assessment.');
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole
-      };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
 
       const res = await fetch(`/api/employees/${employee.id}/hackerrank/trigger`, {
         method: 'POST',
@@ -453,11 +466,7 @@ export default function EmployeeDetailModal({
     setTriggerError('');
     setTriggerSuccess('');
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole,
-      };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
 
       const response = await fetch(`/api/employees/${employee.id}/hackerrank/reconcile`, {
         method: 'POST',
@@ -478,11 +487,7 @@ export default function EmployeeDetailModal({
   const handleSyncExam = async (examId: number) => {
     setIsSyncingExamId(examId);
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole
-      };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
 
       const res = await fetch(`/api/employees/${employee.id}/hackerrank/sync/${examId}`, {
         method: 'POST',
@@ -509,8 +514,7 @@ export default function EmployeeDetailModal({
     setChakraError('');
     setChakraMessage('');
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/chakra/prepare`, { method: 'POST', headers, body: JSON.stringify({}) });
       const data = await readApiJson(response);
       if (!response.ok) throw new Error(data.error || 'Unable to prepare Chakra invitation.');
@@ -535,8 +539,7 @@ export default function EmployeeDetailModal({
     setChakraError('');
     setChakraMessage('');
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/chakra/confirm-invitation`, {
         method: 'POST', headers, body: JSON.stringify({})
       });
@@ -556,8 +559,7 @@ export default function EmployeeDetailModal({
     setChakraError('');
     setChakraMessage('');
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/chakra/mark-invited/${interviewId}`, { method: 'POST', headers, body: JSON.stringify({}) });
       const data = await readApiJson(response);
       if (!response.ok) throw new Error(data.error || 'Could not update invitation status.');
@@ -573,8 +575,7 @@ export default function EmployeeDetailModal({
     setChakraError('');
     setChakraMessage('');
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/chakra/sync/${interviewId}`, { method: 'POST', headers, body: JSON.stringify({}) });
       const data = await readApiJson(response);
       if (!response.ok) throw new Error(data.error || 'Chakra result sync failed.');
@@ -594,8 +595,7 @@ export default function EmployeeDetailModal({
     setChakraMessage('');
     try {
       const csvText = await file.text();
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/chakra/import-csv/${interviewId}`, {
         method: 'POST', headers, body: JSON.stringify({ csvText })
       });
@@ -615,19 +615,36 @@ export default function EmployeeDetailModal({
     const targetStatus = currentStatus === 'Interview Ready' ? 'Enrolled' : 'Interview Ready';
     const actionText = targetStatus === 'Interview Ready' ? 'mark as ready for interview' : 'return to Enrolled';
     if (!window.confirm(`Are you sure you want to ${actionText}: ${employee.name}?`)) return;
+
+    let forceOverride = false;
+    let skipReason = '';
+
+    if (targetStatus === 'Interview Ready' && employee.interviewReadiness !== 'Ready for Interview') {
+      const reason = window.prompt(
+        `Candidate readiness is currently "${employee.interviewReadiness}". To mark this candidate as Ready for Interview, please provide an audit justification (reason):`
+      );
+      if (!reason || !reason.trim()) {
+        setStatusError('An audit justification is mandatory to override interview readiness.');
+        return;
+      }
+      forceOverride = true;
+      skipReason = reason.trim();
+    }
+
     setIsMarkingReady(true);
     setStatusError('');
     setStatusMessage('');
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-simulated-role': simulatedRole };
-      if (token) headers.Authorization = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch(`/api/employees/${employee.id}/mark-interview-ready`, {
-        method: 'POST', headers, body: JSON.stringify({ status: targetStatus })
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ status: targetStatus, forceOverride, skipReason })
       });
       const data = await readApiJson(response);
       if (!response.ok) throw new Error(data.error || 'Could not update status.');
       setStatusOverride(targetStatus);
-      setStatusMessage(targetStatus === 'Interview Ready' ? 'Status saved.' : 'Status reset to Enrolled.');
+      setStatusMessage(targetStatus === 'Interview Ready' ? 'Status saved as Ready for Interview.' : 'Status reset to Enrolled.');
       onRefresh();
     } catch (error: any) {
       setStatusError(error.message || 'Could not update status.');
@@ -636,20 +653,51 @@ export default function EmployeeDetailModal({
     }
   };
 
+  const handleAssessmentPathChange = async (newPath: AssessmentPath) => {
+    let reason = '';
+    if (newPath === 'skip') {
+      const promptResult = window.prompt(
+        'Please provide an audit justification for waiving assessments (e.g. "Senior hire with verified external credentials"):'
+      );
+      if (!promptResult || !promptResult.trim()) {
+        setPathError('An audit justification is required to waive assessments.');
+        return;
+      }
+      reason = promptResult.trim();
+    }
+    setIsUpdatingPath(true);
+    setPathError('');
+    setPathMessage('');
+    try {
+      const headers = createJsonHeaders(token, simulatedRole);
+      const response = await fetch(`/api/employees/${employee.id}/assessment-path`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ assessmentPath: newPath, skipReason: reason })
+      });
+      const data = await readApiJson(response);
+      if (!response.ok) throw new Error(data.error || 'Failed to update assessment path.');
+      setAssessmentPath(newPath);
+      setPathMessage(`Assessment track updated to ${newPath === 'skip' ? 'Bypassed' : newPath}.`);
+      onRefresh();
+    } catch (err: any) {
+      setPathError(err.message || 'Failed to update assessment path.');
+    } finally {
+      setIsUpdatingPath(false);
+    }
+  };
+
   React.useEffect(() => {
     setStatusOverride(null);
-  }, [employee.id, employee.status]);
+    setAssessmentPath(employee.assessmentPath || 'hackerrank');
+  }, [employee.id, employee.status, employee.assessmentPath]);
 
   const handleUpdateEnrollmentDate = async () => {
     setIsUpdatingDate(true);
     setDateError('');
     setDateSuccess('');
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole
-      };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const headers = createJsonHeaders(token, simulatedRole);
 
       const res = await fetch(`/api/employees/${employee.id}`, {
         method: 'PUT',
@@ -749,11 +797,22 @@ export default function EmployeeDetailModal({
             </div>
 
             <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 p-4 min-w-0">
-              <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">Operational status</span>
-              <p className="mt-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">{STATUS_LABELS[statusOverride || employee.status] || statusOverride || employee.status}</p>
-              <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">{employee.currentProject === 'Bench' ? 'On Bench' : employee.currentProject || 'No project assigned'}</p>
+              <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">Interview Readiness</span>
+              <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${
+                  employee.interviewReadiness === 'Ready for Interview' ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/20 dark:text-emerald-400 dark:border-emerald-900/30' :
+                  employee.interviewReadiness === 'Chakra Pending' ? 'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/20 dark:text-violet-400 dark:border-violet-900/30' :
+                  employee.interviewReadiness === 'Assessment In Progress' ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/20 dark:text-blue-400 dark:border-blue-900/30' :
+                  employee.interviewReadiness === 'Assessment Failed' ? 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/20 dark:text-rose-400 dark:border-rose-900/30' :
+                  'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/20 dark:text-amber-400 dark:border-amber-900/30'
+                }`}>
+                  {employee.interviewReadiness || 'Assessment Pending'}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400">Status: {STATUS_LABELS[statusOverride || employee.status] || statusOverride || employee.status}</p>
+              <p className="text-[10px] text-zinc-400">{employee.currentProject === 'Bench' ? 'On Bench' : employee.currentProject || 'No project assigned'}</p>
               {canTrigger && (
-                <button type="button" onClick={handleMarkInterviewReady} disabled={isMarkingReady} className="mt-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 px-3 py-2 text-[10px] font-bold text-white">
+                <button type="button" onClick={handleMarkInterviewReady} disabled={isMarkingReady} className="mt-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 px-3 py-1.5 text-[10px] font-bold text-white cursor-pointer transition-colors">
                   {isMarkingReady ? 'Saving…' : (statusOverride || employee.status) === 'Interview Ready' ? 'Undo · Set Enrolled' : 'Mark ready for interview'}
                 </button>
               )}
@@ -766,6 +825,46 @@ export default function EmployeeDetailModal({
               <p className="mt-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">{employee.currentProject === 'Bench' ? formatDuration(employee.weeksEnrolled, employee.daysEnrolled) : '—'}</p>
             </div>
           </div>
+
+          {/* Assessment Track & Governance Bar */}
+          <div className="bg-zinc-50 dark:bg-zinc-800/40 p-4 rounded-xl border border-zinc-200 dark:border-zinc-800/60 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200">Required Assessment Track:</span>
+                <span className="text-xs font-semibold px-2 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-100 dark:border-indigo-900/30">
+                  {assessmentPath === 'hackerrank' ? 'HackerRank Only' :
+                   assessmentPath === 'chakra' ? 'Chakra AI Only' :
+                   assessmentPath === 'both' ? 'Both Required (HackerRank + Chakra)' : 'Assessments Bypassed'}
+                </span>
+              </div>
+              <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                Determines the required assessments before this candidate qualifies as Ready for Interview.
+              </p>
+              {employee.skipAudit && (
+                <div className="mt-1 text-[11px] text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 rounded-lg px-2.5 py-1">
+                  ⚠️ <strong>Bypass Audit:</strong> Waived by {employee.skipAudit.skippedBy} on {new Date(employee.skipAudit.skippedAt).toLocaleDateString()} — "{employee.skipAudit.reason}"
+                </div>
+              )}
+            </div>
+
+            {canTrigger && (
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                <select
+                  value={assessmentPath}
+                  disabled={isUpdatingPath}
+                  onChange={(e) => handleAssessmentPathChange(e.target.value as AssessmentPath)}
+                  className="bg-white dark:bg-zinc-900 text-xs border border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-60 cursor-pointer"
+                >
+                  <option value="hackerrank">Track: HackerRank Only</option>
+                  <option value="chakra">Track: Chakra AI Only</option>
+                  <option value="both">Track: Both (HackerRank + Chakra)</option>
+                  <option value="skip">Bypass: Skip Assessments</option>
+                </select>
+              </div>
+            )}
+          </div>
+          {pathMessage && <p className="text-[11px] text-emerald-600 font-medium px-1 -mt-3">{pathMessage}</p>}
+          {pathError && <p className="text-[11px] text-rose-600 font-medium px-1 -mt-3">{pathError}</p>}
 
           {/* HackerRank Assessment Section */}
           <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 p-6 rounded-2xl space-y-4">

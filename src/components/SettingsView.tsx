@@ -10,6 +10,7 @@ import {
   RefreshCw,
   FileSpreadsheet
 } from 'lucide-react';
+import { createJsonHeaders } from '../utils/api.ts';
 
 interface SettingsViewProps {
   user: any;
@@ -38,13 +39,7 @@ export default function SettingsView({
   const fetchSeedStatus = async () => {
     setLoadingSeedStatus(true);
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole
-      };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch('/api/seed-status', { headers });
       if (response.ok) {
         const data = await response.json();
@@ -64,13 +59,7 @@ export default function SettingsView({
   const handleManualReseed = async () => {
     setReseeding(true);
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-simulated-role': simulatedRole
-      };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
+      const headers = createJsonHeaders(token, simulatedRole);
       const response = await fetch('/api/reseed-from-excel', {
         method: 'POST',
         headers
@@ -102,13 +91,7 @@ export default function SettingsView({
         const base64 = result.split(',')[1] || result;
 
         setUploadingType(type);
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json'
-        };
-        if (token) {
-          headers['Authorization'] = `Bearer ${token}`;
-        }
-        headers['x-simulated-role'] = simulatedRole;
+        const headers = createJsonHeaders(token, simulatedRole);
 
         const response = await fetch('/api/import-excel', {
           method: 'POST',

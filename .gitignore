@@ -1,0 +1,40 @@
+# Environment files
+.env
+.env.*
+!.env.example
+*.local
+*.env.json
+app/
+.dev.pid
+
+# Local status, cache and dumps
+.seed-status.json
+.pglite_data/
+*.dump
+*.sql.gz
+
+# Secrets and credentials
+*.pem
+*.key
+*.cert
+serviceAccountKey*.json
+*-credentials.json
+
+# Dependencies
+node_modules/
+
+# Production build outputs
+dist/
+dist-ssr/
+*.tsbuildinfo
+
+# Logs and runtime artifacts
+*.log
+*.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System artifacts
+.DS_Store
+Thumbs.db

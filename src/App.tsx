@@ -32,6 +32,8 @@ import {
   Menu
 } from 'lucide-react';
 
+import { createRequestHeaders, createJsonHeaders } from './utils/api.ts';
+
 const API_BASE = ''; // Relative paths to bind to Express dev server / proxy
 
 export default function App() {
@@ -96,8 +98,9 @@ export default function App() {
           });
           if (res.ok) {
             const data = await res.json();
-            setUser({ ...data.user, role: 'admin' });
-            setSimulatedRole('admin');
+            const userRole = (data.user?.role as 'admin' | 'manager' | 'mentor') || 'mentor';
+            setUser(data.user);
+            setSimulatedRole(userRole);
           } else {
             let errorText = 'Auth Sync Error';
             try {
@@ -112,18 +115,22 @@ export default function App() {
           setErrorMsg('Auth connection failed: ' + err.message);
         }
       } else {
-        // Fallback to local sandbox user if no Firebase user is active
         setFirebaseUser(null);
         setToken(null);
-        // Default to a sandbox admin user so the app is instantly usable for review
-        setUser({
-          id: 0,
-          uid: 'sandbox-admin',
-          email: 'sandbox@talentlens.com',
-          role: 'admin',
-          name: 'Sandbox Admin'
-        });
-        setSimulatedRole('admin');
+        if (!import.meta.env.PROD) {
+          // Development sandbox admin user for quick testing without Google login
+          setUser({
+            id: 0,
+            uid: 'sandbox-admin',
+            email: 'sandbox@talentlens.com',
+            role: 'admin',
+            name: 'Sandbox Admin'
+          });
+          setSimulatedRole('admin');
+        } else {
+          // In production, require actual Google Sign-In
+          setUser(null);
+        }
       }
       setAuthLoading(false);
     });
@@ -137,14 +144,7 @@ export default function App() {
     setDataLoading(true);
     setErrorMsg('');
     
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
-    };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-    // Pass the active simulated role header to support server-side middleware simulation
-    headers['x-simulated-role'] = simulatedRole;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       // Parallel data fetching for performance
@@ -156,28 +156,82 @@ export default function App() {
         fetch(`${API_BASE}/api/dashboard/stats`, { headers })
       ]);
 
+      const responses = [empRes, mentorRes, mockRes, attRes, statRes];
+      const authFailedRes = responses.find(r => r.status === 401 || r.status === 403);
+
+      if (authFailedRes) {
+        let authMessage = authFailedRes.status === 403
+          ? 'Access forbidden. Your account does not have sufficient permissions.'
+          : 'Authentication session expired or missing. Please sign in with Google.';
+        try {
+          const errData = await authFailedRes.clone().json();
+          if (errData?.message || errData?.error) {
+            authMessage = errData.message || errData.error;
+          }
+        } catch {}
+
+        setErrorMsg(authMessage);
+        // Requirement C5: Preserve existing data when a refresh fails rather than replacing with empty data!
+        return;
+      }
+
+      let partialError = false;
+
       if (empRes.ok) {
         const empData = await empRes.json();
-        setEmployees(empData.employees);
+        if (Array.isArray(empData.employees)) {
+          setEmployees(empData.employees);
+        }
+      } else {
+        partialError = true;
+        console.error(`[API] Failed to fetch employees: HTTP ${empRes.status}`);
       }
+
       if (mentorRes.ok) {
         const mentorData = await mentorRes.json();
-        setMentors(mentorData.mentors);
+        if (Array.isArray(mentorData.mentors)) {
+          setMentors(mentorData.mentors);
+        }
+      } else {
+        partialError = true;
+        console.error(`[API] Failed to fetch mentors: HTTP ${mentorRes.status}`);
       }
+
       if (mockRes.ok) {
         const mockData = await mockRes.json();
-        setMocks(mockData.mocks);
+        if (Array.isArray(mockData.mocks)) {
+          setMocks(mockData.mocks);
+        }
+      } else {
+        partialError = true;
+        console.error(`[API] Failed to fetch mocks: HTTP ${mockRes.status}`);
       }
+
       if (attRes.ok) {
         const attData = await attRes.json();
-        setAttendanceLogs(attData.attendance);
+        if (Array.isArray(attData.attendance)) {
+          setAttendanceLogs(attData.attendance);
+        }
+      } else {
+        partialError = true;
+        console.error(`[API] Failed to fetch attendance: HTTP ${attRes.status}`);
       }
+
       if (statRes.ok) {
         const statData = await statRes.json();
-        setStats(statData.stats);
+        if (statData.stats) {
+          setStats(statData.stats);
+        }
+      } else {
+        partialError = true;
+        console.error(`[API] Failed to fetch dashboard stats: HTTP ${statRes.status}`);
+      }
+
+      if (partialError) {
+        setErrorMsg('Some data could not be refreshed. Preserving previously loaded records.');
       }
     } catch (err: any) {
-      setErrorMsg('Data fetching failed: ' + err.message);
+      setErrorMsg('Data fetching failed: ' + (err.message || 'Network error'));
     } finally {
       setDataLoading(false);
     }
@@ -210,7 +264,18 @@ export default function App() {
       await signInWithPopup(auth, googleAuthProvider);
       setSuccessMsg('Successfully signed in with Google Auth!');
     } catch (err: any) {
-      setErrorMsg('Sign-in failed: ' + err.message);
+      if (err?.code === 'auth/unauthorized-domain') {
+        const domain = window.location.hostname;
+        setErrorMsg(
+          `OAuth Domain Not Authorized: "${domain}" is not in the Firebase Authorized Domains list. Please add "${domain}" in Firebase Console → Authentication → Settings → Authorized domains.`
+        );
+      } else if (err?.code === 'auth/popup-blocked') {
+        setErrorMsg('Sign-in popup was blocked by your browser. Please allow popups for this site and try again.');
+      } else if (err?.code === 'auth/cancelled-popup-request' || err?.code === 'auth/popup-closed-by-user') {
+        setErrorMsg('Sign-in was cancelled.');
+      } else {
+        setErrorMsg('Sign-in failed: ' + (err?.message || 'Unknown error'));
+      }
     }
   };
 
@@ -249,11 +314,7 @@ export default function App() {
 
   // Actions: Employee CRUD
   const handleAddEmployee = async (employeeData: Partial<Employee>) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createJsonHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/employees`, {
@@ -276,11 +337,7 @@ export default function App() {
   };
 
   const handleAddMentor = async (mentorData: any) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createJsonHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/mentors`, {
@@ -303,11 +360,7 @@ export default function App() {
   };
 
   const handleUpdateEmployee = async (empId: number, employeeData: Partial<Employee>) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createJsonHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/employees/${empId}`, {
@@ -330,11 +383,7 @@ export default function App() {
   };
 
   const handleDeleteEmployee = async (empId: number) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/employees/${empId}`, {
@@ -356,11 +405,7 @@ export default function App() {
   };
 
   const handleQuickUpdateStatus = async (empId: number, status: 'Enrolled' | 'Available' | 'In Training' | 'Allocated' | 'Interview Ready') => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/employees/${empId}/status`, {
@@ -382,11 +427,7 @@ export default function App() {
 
   // Actions: Mock Interviews
   const handleAddMock = async (mockData: Partial<MockInterview>) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/mocks`, {
@@ -410,11 +451,7 @@ export default function App() {
 
   // Actions: Attendance
   const handleAddSession = async (sessionPayload: { sessionName: string, sessionDate: string, topic: string, logs: { employeeId: number, status: 'Present' | 'Absent' | 'Late' }[] }) => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/attendance`, {
@@ -437,11 +474,7 @@ export default function App() {
   };
 
   const handleUpdateLog = async (logId: number, status: 'Present' | 'Absent' | 'Late') => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-simulated-role': simulatedRole
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const headers = createRequestHeaders(token, simulatedRole);
 
     try {
       const res = await fetch(`${API_BASE}/api/attendance/${logId}`, {
@@ -498,7 +531,7 @@ export default function App() {
             <button
               id="google-sign-in-btn"
               onClick={handleGoogleSignIn}
-              className="w-full flex items-center justify-center gap-3 bg-white hover:bg-zinc-100 text-zinc-900 font-bold py-3 px-4 rounded-xl transition-all shadow-md text-sm"
+              className="w-full flex items-center justify-center gap-3 bg-white hover:bg-zinc-100 text-zinc-900 font-bold py-3 px-4 rounded-xl transition-all shadow-md text-sm cursor-pointer"
             >
               <svg className="w-5 h-5" viewBox="0 0 24 24">
                 <path fill="#EA4335" d="M12 5.04c1.66 0 3.2.57 4.38 1.69l3.27-3.27C17.67 1.48 15.02 1 12 1 7.21 1 3.16 3.73 1.15 7.74l3.85 2.99C5.9 7.42 8.7 5.04 12 5.04z" />
@@ -510,22 +543,24 @@ export default function App() {
             </button>
           </div>
 
-          {/* Sandbox Access (Immediate review) */}
-          <div className="space-y-4">
-            <div className="flex items-center justify-center gap-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
-              <ShieldCheck className="w-4 h-4 text-indigo-500" />
-              <span>Review Sandbox Access</span>
+          {/* Sandbox Access (Development mode only) */}
+          {!import.meta.env.PROD && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-center gap-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
+                <ShieldCheck className="w-4 h-4 text-indigo-500" />
+                <span>Development Sandbox Access</span>
+              </div>
+              
+              <button
+                id="sandbox-login-admin"
+                onClick={() => handleSimulatedRoleChange('admin')}
+                className="w-full p-4 bg-zinc-800/40 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 text-zinc-250 rounded-xl transition-all text-left flex flex-col justify-between h-20 font-bold cursor-pointer"
+              >
+                <span className="text-red-400">Sandbox Admin Access</span>
+                <span className="text-[10px] text-zinc-500 font-semibold">Pre-loaded assessments, system logs &amp; controls</span>
+              </button>
             </div>
-            
-            <button
-              id="sandbox-login-admin"
-              onClick={() => handleSimulatedRoleChange('admin')}
-              className="w-full p-4 bg-zinc-800/40 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 text-zinc-250 rounded-xl transition-all text-left flex flex-col justify-between h-20 font-bold"
-            >
-              <span className="text-red-400">Sandbox Admin Access</span>
-              <span className="text-[10px] text-zinc-500 font-semibold">Pre-loaded assessments, system logs &amp; controls</span>
-            </button>
-          </div>
+          )}
         </div>
       </div>
     );
@@ -602,6 +637,21 @@ export default function App() {
           <div className="fixed bottom-4 right-4 bg-red-600 text-white font-semibold text-xs px-4 py-3 rounded-xl shadow-lg flex items-center gap-2.5 z-50 animate-bounce">
             <AlertCircle className="w-4 h-4 bg-red-700/80 rounded-full p-0.5" />
             <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {/* Temporary Testing Mode Banner */}
+        {user?.isTestingMode && (
+          <div className="mb-6 px-4 py-2.5 bg-amber-500/10 dark:bg-amber-500/15 border border-amber-500/30 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-amber-700 dark:text-amber-300">
+            <div className="flex items-center gap-2.5 font-medium">
+              <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />
+              <span>
+                <strong>TEMPORARY TESTING MODE:</strong> Authenticated as <span className="font-mono font-semibold">{user.email}</span> with Admin permissions. (Registered role: <span className="font-mono uppercase">{user.originalRole || user.role}</span>)
+              </span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 bg-amber-500/20 rounded-md shrink-0 self-start sm:self-auto">
+              Testing Mode Active
+            </span>
           </div>
         )}
 

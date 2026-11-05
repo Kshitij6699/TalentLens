@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.js",
+    "start": "node dist/server.js",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "db:admin:init": "tsx scripts/stage_a_admin_init.ts",
+    "db:admin:dry-run": "tsx scripts/stage_a_admin_init.ts --dry-run"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",

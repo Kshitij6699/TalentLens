@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import { createRequire } from 'node:module';
 import express from 'express';
 import path from 'path';
 import { readFileSync } from 'node:fs';
@@ -7,15 +6,14 @@ import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import * as XLSXModule from 'xlsx';
 const XLSX = (XLSXModule as any).default || XLSXModule;
+import { eq, desc, and } from 'drizzle-orm';
 import { db, initDatabase } from './src/db/index.ts';
 import { users, employees, mockInterviews, attendance, mentorSessions, mentors, hackerrankExams, chakraInterviews } from './src/db/schema.ts';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import firebaseConfig from './firebase-applet-config.json';
-import { seedFromExcelFiles, mapExcelLevelToDesignation, getDesignationRank, getSeedStatus } from './src/db/seed_excel.ts';
-
-const require = createRequire(import.meta.url);
-const { eq, desc, and } = require('drizzle-orm');
+import { seedFromExcelFiles, seedMentorsFromExcel, seedEmployeesFromExcel, seedDemoCandidate, mapExcelLevelToDesignation, getDesignationRank, getSeedStatus } from './src/db/seed_excel.ts';
+import { evaluateCandidateReadiness, parseEmployeeAssessmentSettings, serializeEmployeeAssessmentSettings } from './src/utils/readiness.ts';
 
 // Initialize Firebase Admin
 if (!getApps().length) {
@@ -26,10 +24,66 @@ if (!getApps().length) {
 const adminAuth = getAuth();
 
 const app = express();
-const PORT = 3000;
+const DEFAULT_PORT = 3000;
+const PORT = Number(process.env.PORT) || DEFAULT_PORT;
 
-app.use(cors());
+// Restrict CORS in production to configured allowed origins
+const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
+  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : (process.env.FRONTEND_URL ? [process.env.FRONTEND_URL.trim()] : []);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // In development / non-production, allow all origins
+    if (process.env.NODE_ENV !== 'production') {
+      return callback(null, true);
+    }
+    // In production, allow requests with no origin (e.g. mobile apps, same-origin, curl)
+    if (!origin) {
+      return callback(null, true);
+    }
+    // If explicit origins configured, allow matching origins or .run.app preview domains
+    if (allowedOrigins.length > 0) {
+      if (allowedOrigins.includes(origin) || origin.endsWith('.run.app')) {
+        return callback(null, true);
+      }
+      return callback(new Error(`CORS policy: origin ${origin} not permitted.`));
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+}));
+
 app.use(express.json({ limit: '5mb' }));
+
+// Unauthenticated health-check endpoints for Cloud Run & AI Studio probes
+app.get('/api/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development',
+    temporaryTestingMode: TEMPORARY_ADMIN_TESTING_MODE,
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', temporaryTestingMode: TEMPORARY_ADMIN_TESTING_MODE });
+});
+
+// ============================================================================
+// TEMPORARY TESTING MODE CONFIGURATION
+// When enabled (true), all authenticated users with verified Google accounts receive
+// effective 'admin' permissions during runtime authorization checks for product testing.
+//
+// HOW TO RESTORE NORMAL RBAC LATER:
+// Set TEMPORARY_ADMIN_TESTING_MODE to false below or set the environment variable
+// TEMPORARY_ADMIN_TESTING_MODE=false.
+// Because database records in the 'users' table are never permanently mutated,
+// setting this flag to false instantly restores individual Admin, Manager, and Mentor
+// permissions with zero database rollback or schema migration needed.
+// ============================================================================
+export const TEMPORARY_ADMIN_TESTING_MODE = process.env.TEMPORARY_ADMIN_TESTING_MODE !== 'false';
 
 // Type-safe Request customization
 export interface AuthRequest extends express.Request {
@@ -38,18 +92,134 @@ export interface AuthRequest extends express.Request {
     email: string;
     name: string;
     role: string;
+    originalRole?: string;
     id?: number; // DB serial primary key
+    isTestingMode?: boolean;
   };
 }
 
 // Authentication Middleware
 const authenticateUser = async (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const hasSimulatedRole = req.headers['x-simulated-role'] !== undefined;
+  const hasMockRole = req.headers['x-mock-role'] !== undefined;
+
+  // 1. STRICT PRODUCTION SECURITY POLICY:
+  // In production, reject ANY request containing x-simulated-role or x-mock-role immediately with HTTP 401.
+  // This rejection occurs regardless of whether a valid Firebase Bearer token is also present.
+  // Do NOT proceed with Firebase token validation for requests carrying these forbidden headers.
+  if (isProduction && (hasSimulatedRole || hasMockRole)) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Simulated and mock authentication headers (x-simulated-role, x-mock-role) are strictly forbidden in production. Requests carrying these headers are rejected.',
+    });
+  }
+
+  // 2. Real Google Sign-In / Firebase Bearer token verification
   const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split('Bearer ')[1]?.trim();
+    if (token) {
+      try {
+        const decodedToken = await adminAuth.verifyIdToken(token);
+
+        // 1. Verify email presence and email_verified status before account matching
+        const email = (decodedToken.email || '').trim().toLowerCase();
+        if (!email || !decodedToken.email_verified) {
+          console.warn(`[Auth] Rejected token: email missing or unverified (${email || 'none'})`);
+          return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'A verified email address is required for authentication.',
+          });
+        }
+
+        const name = decodedToken.name || (email ? email.split('@')[0] : 'TalentLens User');
+
+        // 2, 3 & 4. Transactional reconciliation, UID conflict prevention, and ID/role/foreign-key preservation
+        const userRecord = await db.transaction(async (tx: any) => {
+          // Check if user exists by email
+          const dbUser = await tx.select().from(users).where(eq(users.email, email)).limit(1);
+
+          // Check for any conflict with the incoming Firebase UID across other users
+          const existingByUid = await tx.select().from(users).where(eq(users.uid, decodedToken.uid)).limit(1);
+
+          if (dbUser.length === 0) {
+            // New user registration: ensure UID is not already owned by another account
+            if (existingByUid.length > 0 && existingByUid[0].email !== email) {
+              throw new Error(`UID conflict: Firebase UID ${decodedToken.uid} is already associated with email ${existingByUid[0].email}`);
+            }
+
+            // Determine user role (default mentor)
+            let role = 'mentor';
+            if (email === 'sharmisthasinghroy@gmail.com' || email === 'mankarkshitij619@gmail.com') {
+              role = 'admin';
+            }
+
+            const inserted = await tx.insert(users).values({
+              uid: decodedToken.uid,
+              email,
+              name,
+              role,
+            }).returning();
+            return inserted[0];
+          }
+
+          const existingUser = dbUser[0];
+
+          // Ensure incoming UID is not conflicting with a different user record
+          if (existingByUid.length > 0 && existingByUid[0].id !== existingUser.id) {
+            throw new Error(`UID conflict: Firebase UID ${decodedToken.uid} is already mapped to user ID ${existingByUid[0].id} (${existingByUid[0].email})`);
+          }
+
+          // Preserve existing roles and permissions; guarantee admin for bootstrapped administrators
+          let targetRole = existingUser.role;
+          if (email === 'sharmisthasinghroy@gmail.com' || email === 'mankarkshitij619@gmail.com') {
+            targetRole = 'admin';
+          }
+
+          const updates: Partial<{ uid: string; role: string; name: string }> = {};
+          if (existingUser.role !== targetRole) {
+            updates.role = targetRole;
+          }
+          if (existingUser.uid !== decodedToken.uid) {
+            updates.uid = decodedToken.uid;
+          }
+          if (decodedToken.name && existingUser.name !== decodedToken.name && (!existingUser.name || existingUser.name === 'DE Resource')) {
+            updates.name = decodedToken.name;
+          }
+
+          if (Object.keys(updates).length > 0) {
+            const updated = await tx.update(users).set(updates).where(eq(users.id, existingUser.id)).returning();
+            return updated[0];
+          }
+
+          return existingUser;
+        });
+
+        const effectiveRole = TEMPORARY_ADMIN_TESTING_MODE ? 'admin' : userRecord.role;
+
+        req.user = {
+          uid: decodedToken.uid,
+          email,
+          name: userRecord.name,
+          role: effectiveRole,
+          originalRole: userRecord.role,
+          id: userRecord.id, // Preserves serial DB user ID and FK integrity
+          isTestingMode: TEMPORARY_ADMIN_TESTING_MODE,
+        };
+        return next();
+      } catch (error: any) {
+        console.error('Firebase Auth verification failed:', error?.message || error);
+        return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+      }
+    }
+  }
+
+  // 3. Mock Role Header (ONLY permitted in development / non-production environments)
   const mockRoleHeader = req.headers['x-mock-role'] || req.headers['x-simulated-role'];
   const mockEmailHeader = req.headers['x-mock-email'] || req.headers['x-simulated-email'];
 
-  // 1. Support Mock Login for development/testing and seamless role-based navigation
-  if (mockRoleHeader) {
+  if (!isProduction && mockRoleHeader) {
     const role = String(mockRoleHeader).toLowerCase();
     const email = mockEmailHeader ? String(mockEmailHeader) : `${role}@example.com`;
     const name = mockEmailHeader 
@@ -76,63 +246,22 @@ const authenticateUser = async (req: AuthRequest, res: express.Response, next: e
       }
     }
 
+    const effectiveRole = TEMPORARY_ADMIN_TESTING_MODE ? 'admin' : role;
+
     req.user = {
       uid: `mock_uid_${role}`,
       email,
       name,
-      role,
+      role: effectiveRole,
+      originalRole: role,
       id: userId,
+      isTestingMode: TEMPORARY_ADMIN_TESTING_MODE,
     };
     return next();
   }
 
-  // 2. Real Google Sign-In / Firebase token verification
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Missing token' });
-  }
-
-  const token = authHeader.split('Bearer ')[1];
-  try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    const email = decodedToken.email || '';
-    const name = decodedToken.name || 'DE Resource';
-
-    // Look up user in SQL database
-    let dbUser = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    let userRecord;
-
-    if (dbUser.length === 0) {
-      // Determine user role
-      let role = 'mentor'; // default
-
-      // Bootstrapped Admin check
-      if (email === 'sharmisthasinghroy@gmail.com') {
-        role = 'admin';
-      }
-
-      const inserted = await db.insert(users).values({
-        uid: decodedToken.uid,
-        email,
-        name,
-        role,
-      }).returning();
-      userRecord = inserted[0];
-    } else {
-      userRecord = dbUser[0];
-    }
-
-    req.user = {
-      uid: decodedToken.uid,
-      email,
-      name,
-      role: userRecord.role,
-      id: userRecord.id,
-    };
-    next();
-  } catch (error) {
-    console.error('Firebase Auth verification failed:', error);
-    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
-  }
+  // 4. Unauthenticated request without valid token -> 401 Unauthorized
+  return res.status(401).json({ error: 'Unauthorized: Missing token' });
 };
 
 // ==========================================
@@ -195,7 +324,8 @@ function computeClassificationTier(
   emp: any,
   empMocks: any[],
   empAttendance: any[],
-  empSessions: any[]
+  empSessions: any[],
+  readinessEval?: any
 ) {
   const startStr = emp.programEnrollmentDate || emp.joiningDate;
   const { weeksEnrolled, daysEnrolled } = getEnrollmentDuration(startStr);
@@ -230,31 +360,29 @@ function computeClassificationTier(
   let classificationTier: 'Client Ready' | 'Allocated' | 'Needs Support' | 'Interview Ready' | 'In Training' | 'N/A' = 'In Training';
   const tierReasons: string[] = [];
 
-  if (emp.status === 'Interview Ready') {
-    classificationTier = 'Client Ready';
-  } else if (emp.status === 'Allocated') {
+  if (emp.status === 'Allocated' || (emp.currentProject && emp.currentProject !== 'Bench')) {
     classificationTier = 'Allocated';
-  } else {
-    // Under enrollment: binary in intent (Needs Support vs Interview Ready, otherwise neutral "In Training")
-    
-    // TIER 3 - NEEDS SUPPORT ⚠️
-    let isNeedsSupport = false;
-    if (overallScore !== null && overallScore < 2.5) {
-      isNeedsSupport = true;
-      tierReasons.push(`Overall HackerRank score < 2.5 (Current: ${overallScore})`);
+  } else if (readinessEval?.readiness === 'Ready for Interview' || emp.status === 'Interview Ready') {
+    if (readinessEval?.readiness === 'Ready for Interview') {
+      classificationTier = 'Client Ready';
+    } else {
+      classificationTier = 'In Training';
+      if (readinessEval?.reasons?.length) {
+        tierReasons.push(...readinessEval.reasons);
+      }
     }
-    if (weeksEnrolled > 12 && emp.status !== 'Interview Ready' && emp.status !== 'Allocated') {
+  } else if (readinessEval?.readiness === 'Assessment Failed') {
+    classificationTier = 'Needs Support';
+    tierReasons.push(...(readinessEval.reasons || ['Assessment failed.']));
+  } else {
+    let isNeedsSupport = false;
+    if (weeksEnrolled > 12) {
       isNeedsSupport = true;
       tierReasons.push(`Enrolled > 12 weeks on bench (Current: ${weeksEnrolled} weeks)`);
     }
 
-    // TIER 1 - INTERVIEW READY (Client Ready equivalent under enrollment) ✅
-    const meetsInterviewReady = overallScore !== null && overallScore >= 4.0;
-
     if (isNeedsSupport) {
       classificationTier = 'Needs Support';
-    } else if (meetsInterviewReady) {
-      classificationTier = 'Interview Ready';
     } else {
       classificationTier = 'In Training';
     }
@@ -292,6 +420,9 @@ async function getEnrichedEmployees() {
     // Drafts are not invitations. Never expose unconfirmed Invite Prepared rows as history.
     const empChakraInterviews = allChakraInterviews.filter(e => e.employeeId === emp.id && e.status !== 'Invite Prepared');
 
+    // Authoritative candidate readiness derivation based on recruiter path and assessment results
+    const readinessEval = evaluateCandidateReadiness(emp, empExams, empChakraInterviews);
+
     const {
       classificationTier,
       tierReasons,
@@ -305,7 +436,7 @@ async function getEnrichedEmployees() {
       consecutiveResourcesOverdueCount,
       resourcesOverdue,
       retentionIssue,
-    } = computeClassificationTier(emp, empMocks, empAttendance, empSessions);
+    } = computeClassificationTier(emp, empMocks, empAttendance, empSessions, readinessEval);
 
     // Flags from latest session
     let managerAttentionRequired = false;
@@ -373,6 +504,11 @@ async function getEnrichedEmployees() {
       overallScore,
       classificationTier,
       tierReasons,
+      interviewReadiness: readinessEval.readiness,
+      assessmentPath: readinessEval.assessmentPath,
+      readinessReasons: readinessEval.reasons,
+      canMarkReady: readinessEval.canMarkReady,
+      skipAudit: readinessEval.skipAudit || null,
       consecutiveResourcesOverdueCount,
       managerAttentionRequired,
       resourcesOverdue,
@@ -1100,7 +1236,7 @@ app.get('/api/hackerrank/tests', authenticateUser, async (req: AuthRequest, res)
 
   const apiKey = process.env.HACKERRANK_API_KEY?.trim();
   if (!apiKey || apiKey === 'your_hackerrank_api_key_here') {
-    return res.status(503).json({
+    return res.status(400).json({
       error: 'HACKERRANK_API_KEY is not configured. Add a valid HackerRank for Work API token to the root .env file and restart the server.'
     });
   }
@@ -1126,7 +1262,7 @@ app.get('/api/hackerrank/tests', authenticateUser, async (req: AuthRequest, res)
         payload = responseText ? JSON.parse(responseText) : {};
       } catch {
         console.error(`[HackerRank] Test list returned non-JSON content (HTTP ${response.status}).`);
-        return res.status(502).json({
+        return res.status(400).json({
           error: 'HackerRank returned an unexpected response while loading tests. Check the API token, account permissions, and HackerRank API availability.'
         });
       }
@@ -1134,7 +1270,7 @@ app.get('/api/hackerrank/tests', authenticateUser, async (req: AuthRequest, res)
       if (!response.ok) {
         const upstreamMessage = typeof payload?.message === 'string' ? payload.message : '';
         console.error(`[HackerRank] Failed to list tests: HTTP ${response.status} ${upstreamMessage}`);
-        return res.status(502).json({
+        return res.status(400).json({
           error: response.status === 401 || response.status === 403
             ? 'HackerRank rejected the API token or it does not have permission to list tests.'
             : `HackerRank could not load tests (HTTP ${response.status}).`
@@ -1212,7 +1348,7 @@ app.get('/api/hackerrank/tests', authenticateUser, async (req: AuthRequest, res)
     });
   } catch (error: any) {
     console.error('[HackerRank] Error loading tests:', error);
-    return res.status(502).json({ error: 'Failed to connect to HackerRank while loading tests.' });
+    return res.status(400).json({ error: 'Failed to connect to HackerRank while loading tests.' });
   }
 });
 
@@ -1228,7 +1364,7 @@ app.post('/api/employees/:id/hackerrank/trigger', authenticateUser, async (req: 
 
   const apiKey = process.env.HACKERRANK_API_KEY?.trim();
   if (!apiKey || apiKey === 'your_hackerrank_api_key_here') {
-    return res.status(503).json({ error: 'HACKERRANK_API_KEY is not configured. Add a valid HackerRank for Work API token to the root .env file and restart the server. No invitation was sent.' });
+    return res.status(400).json({ error: 'HACKERRANK_API_KEY is not configured. Add a valid HackerRank for Work API token to the root .env file and restart the server. No invitation was sent.' });
   }
 
   try {
@@ -1332,7 +1468,7 @@ app.post('/api/employees/:id/hackerrank/trigger', authenticateUser, async (req: 
     });
     const initialStatus = candidate?.status !== undefined ? mapHackerRankStatus(candidate.status) : 'Invited';
     const initialScore = getHackerRankScore(candidate);
-    const initialCompletedAt = parseHackerRankTimestamp(candidate);
+    const initialCompletedAt = initialStatus === 'Completed' ? parseHackerRankTimestamp(candidate) : null;
 
     const inserted = await db.insert(hackerrankExams).values({
       employeeId: empId,
@@ -1414,36 +1550,84 @@ app.post('/api/employees/:id/hackerrank/reconcile', authenticateUser, async (req
       }
     }
 
-    const currentStatus = mapHackerRankStatus(candidate?.status);
+    const currentStatus = candidate?.status !== undefined ? mapHackerRankStatus(candidate.status) : 'Invited';
     const currentScore = getHackerRankScore(candidate);
-    const completedAt = parseHackerRankTimestamp(candidate);
+    const providerCompletedAt = parseHackerRankTimestamp(candidate);
     const reconciledOutcome = getHackerRankOutcome(candidate);
     const workflowMapping = loadHackerRankTestCatalog().get(String(testId));
-    const rawResponse = JSON.stringify({
-      source: 'HackerRank', simulated: false, candidateId: candidateId ? String(candidateId) : null,
-      testCutoffScore, assessmentOutcome: reconciledOutcome,
-      assessmentOutcomeRecordedAt: reconciledOutcome ? new Date().toISOString() : null,
-      assessmentWorkflow: workflowMapping ? { experienceBand: workflowMapping.experienceBand, difficulty: workflowMapping.level, code: workflowMapping.code } : null,
-      testMetadata: { name: testName, code: workflowMapping?.code ?? null }, candidate, reconciledAt: new Date().toISOString(),
-      reconciliationMethod: candidateId ? 'candidate-detail-by-email-match' : 'candidate-list-by-exact-email',
-    });
 
-    const existing = await db.select().from(hackerrankExams)
+    // Idempotent attempt lookup: match by candidateId if present, or by testId
+    const existingAttempts = await db.select().from(hackerrankExams)
       .where(and(eq(hackerrankExams.employeeId, empId), eq(hackerrankExams.testId, testId)))
-      .orderBy(desc(hackerrankExams.triggeredAt)).limit(1);
+      .orderBy(desc(hackerrankExams.triggeredAt));
+
+    let existingMatch = existingAttempts[0];
+    if (candidateId) {
+      const byId = existingAttempts.find((rec: any) => {
+        try {
+          const parsed = rec.rawResponse ? JSON.parse(rec.rawResponse) : {};
+          return String(parsed.candidateId) === String(candidateId);
+        } catch { return false; }
+      });
+      if (byId) existingMatch = byId;
+    }
+
     let saved: any;
-    if (existing.length) {
-      // Replace stale local/recruiter overrides with the provider's current candidate record.
-      const savedCompletedAt = parseHackerRankTimestamp(candidate) || existing[0].completedAt || (currentStatus === 'Completed' ? new Date() : null);
+    if (existingMatch) {
+      let existingStored: any = {};
+      try { existingStored = existingMatch.rawResponse ? JSON.parse(existingMatch.rawResponse) : {}; } catch {}
+
+      // Status protection: do not blindly downgrade Completed to Invited from partial response
+      const finalStatus = (existingMatch.status === 'Completed' && currentStatus !== 'Completed')
+        ? existingMatch.status
+        : currentStatus;
+
+      // Score protection: preserve existing valid score if provider temporarily omitted it
+      const finalScore = currentScore !== null ? currentScore : existingMatch.score;
+
+      // Outcome protection: preserve valid outcome if provider temporarily omitted it
+      const finalOutcome = reconciledOutcome !== null ? reconciledOutcome : (existingStored.assessmentOutcome || null);
+
+      // Timestamp protection: only completed exams have completion timestamps; never infer from new Date()
+      const finalCompletedAt = finalStatus === 'Completed'
+        ? (providerCompletedAt || (existingMatch.status === 'Completed' ? existingMatch.completedAt : null))
+        : null;
+
+      // Field ownership: preserve recruiter notes, manual overrides, and audit trails
+      const mergedRawResponse = JSON.stringify({
+        ...existingStored,
+        source: 'HackerRank',
+        simulated: false,
+        candidateId: candidateId ? String(candidateId) : existingStored.candidateId || null,
+        testCutoffScore,
+        assessmentOutcome: finalOutcome,
+        providerAssessmentOutcome: finalOutcome,
+        assessmentOutcomeRecordedAt: finalOutcome ? (existingStored.assessmentOutcomeRecordedAt || new Date().toISOString()) : null,
+        assessmentWorkflow: workflowMapping ? { experienceBand: workflowMapping.experienceBand, difficulty: workflowMapping.level, code: workflowMapping.code } : existingStored.assessmentWorkflow || null,
+        testMetadata: { name: testName, code: workflowMapping?.code ?? null },
+        candidate,
+        reconciledAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+      });
+
       const updated = await db.update(hackerrankExams).set({
-        testName, status: currentStatus, score: currentScore, completedAt: savedCompletedAt, rawResponse,
-      }).where(eq(hackerrankExams.id, existing[0].id)).returning();
+        testName, status: finalStatus, score: finalScore, completedAt: finalCompletedAt, rawResponse: mergedRawResponse,
+      }).where(eq(hackerrankExams.id, existingMatch.id)).returning();
       saved = updated[0];
     } else {
+      const initialCompletedAt = currentStatus === 'Completed' ? providerCompletedAt : null;
+      const rawResponse = JSON.stringify({
+        source: 'HackerRank', simulated: false, candidateId: candidateId ? String(candidateId) : null,
+        testCutoffScore, assessmentOutcome: reconciledOutcome,
+        assessmentOutcomeRecordedAt: reconciledOutcome ? new Date().toISOString() : null,
+        assessmentWorkflow: workflowMapping ? { experienceBand: workflowMapping.experienceBand, difficulty: workflowMapping.level, code: workflowMapping.code } : null,
+        testMetadata: { name: testName, code: workflowMapping?.code ?? null }, candidate, reconciledAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+      });
       const inserted = await db.insert(hackerrankExams).values({
         employeeId: empId, testId, testName, triggeredAt: new Date(),
         triggeredBy: req.user?.name || req.user?.email || 'HackerRank sync',
-        status: currentStatus, score: currentScore, completedAt, rawResponse,
+        status: currentStatus, score: currentScore, completedAt: initialCompletedAt, rawResponse,
       }).returning();
       saved = inserted[0];
     }
@@ -1527,50 +1711,53 @@ app.post('/api/employees/:id/hackerrank/sync/:examId', authenticateUser, async (
       }
     }
 
-    const status = mapHackerRankStatus(candidate?.status);
-    const score = getHackerRankScore(candidate);
+    const incomingStatus = candidate?.status !== undefined ? mapHackerRankStatus(candidate.status) : exam.status;
+    // Status protection: do not downgrade Completed to Invited/Pending from partial response
+    const finalStatus = (exam.status === 'Completed' && incomingStatus !== 'Completed') ? exam.status : incomingStatus;
+
+    // Score protection: preserve existing valid score if incoming is null/undefined
+    const incomingScore = getHackerRankScore(candidate);
+    const finalScore = incomingScore !== null ? incomingScore : exam.score;
+
+    // Outcome protection: preserve valid outcome if incoming is null
+    const incomingOutcome = getHackerRankOutcome(candidate);
+    const finalOutcome = incomingOutcome !== null ? incomingOutcome : (stored?.assessmentOutcome || null);
+
     const syncedAt = new Date();
     const providerCompletedAt = parseHackerRankTimestamp(candidate);
-    // HackerRank can report status=7 (report ready) without including a completion timestamp.
-    // Persist the first time TalentLens confirms that completed state instead of showing a blank date.
-    const completedAt = providerCompletedAt || exam.completedAt || (status === 'Completed' ? syncedAt : null);
-    const completionTimestampSource = providerCompletedAt
+    const finalCompletedAt = finalStatus === 'Completed'
+      ? (providerCompletedAt || (exam.status === 'Completed' ? exam.completedAt : null))
+      : null;
+    const completionTimestampSource = finalStatus === 'Completed' && providerCompletedAt
       ? 'HackerRank'
-      : exam.completedAt
-        ? (stored?.completionTimestampSource || 'previously recorded')
-        : status === 'Completed'
-          ? 'TalentLens first confirmed completion during sync'
-          : null;
+      : (stored?.completionTimestampSource || null);
     const testCutoffScore = stored?.testCutoffScore ?? null;
-    const providerAssessmentOutcome = getHackerRankOutcome(candidate);
     const workflowMetadata = getExamWorkflowMetadata(exam);
-    // Remove legacy manualReview metadata and always display the latest outcome reported by HackerRank.
-    const storedWithoutManualReview = { ...(stored || {}) };
-    delete storedWithoutManualReview.manualReview;
+
     const updatedRawResponse = JSON.stringify({
-      ...storedWithoutManualReview,
+      ...stored,
       source: 'HackerRank',
       simulated: false,
-      candidateId: candidateId ? String(candidateId) : null,
+      candidateId: candidateId ? String(candidateId) : stored?.candidateId || null,
       testCutoffScore,
-      assessmentOutcome: providerAssessmentOutcome,
-      providerAssessmentOutcome,
-      assessmentOutcomeRecordedAt: providerAssessmentOutcome ? syncedAt.toISOString() : null,
+      assessmentOutcome: finalOutcome,
+      providerAssessmentOutcome: finalOutcome,
+      assessmentOutcomeRecordedAt: finalOutcome ? (stored?.assessmentOutcomeRecordedAt || syncedAt.toISOString()) : null,
       assessmentWorkflow: workflowMetadata,
       completionTimestampSource,
-      completionConfirmedAt: status === 'Completed' && !providerCompletedAt ? completedAt?.toISOString() : stored?.completionConfirmedAt ?? null,
-      candidate,
+      completionConfirmedAt: finalStatus === 'Completed' && providerCompletedAt ? providerCompletedAt.toISOString() : (stored?.completionConfirmedAt || null),
+      candidate: candidate || stored?.candidate,
       lastSyncedAt: syncedAt.toISOString(),
     });
 
     const updated = await db.update(hackerrankExams).set({
-      status,
-      score,
-      completedAt,
+      status: finalStatus,
+      score: finalScore,
+      completedAt: finalCompletedAt,
       rawResponse: updatedRawResponse,
     }).where(eq(hackerrankExams.id, examId)).returning();
 
-    return res.json({ ...updated[0], outcome: providerAssessmentOutcome, outcomeSource: 'HackerRank' });
+    return res.json({ ...updated[0], outcome: finalOutcome, outcomeSource: 'HackerRank' });
   } catch (error: any) {
     console.error('Error synchronizing HackerRank assessment:', error.message || error);
     return res.status(502).json({ error: error.message || 'Failed to synchronize the real HackerRank assessment.' });
@@ -1617,11 +1804,13 @@ app.post('/api/webhooks/hackerrank', async (req, res) => {
     const cutoff = previous?.testCutoffScore ?? null;
     const status = mapHackerRankStatus(candidate?.status ?? payload?.status);
     const score = getHackerRankScore(candidate);
-    const completedAt = parseHackerRankTimestamp(candidate) || exam.completedAt || null;
+    const providerCompletedAt = parseHackerRankTimestamp(candidate);
+    const finalCompletedAt = status === 'Completed'
+      ? (providerCompletedAt || (exam.status === 'Completed' ? exam.completedAt : null))
+      : null;
     const providerAssessmentOutcome = getHackerRankOutcome(candidate);
     const workflowMetadata = getExamWorkflowMetadata(exam);
     const webhookAt = new Date();
-    const finalCompletedAt = completedAt || (status === 'Completed' ? exam.completedAt || webhookAt : null);
     const previousWithoutManualReview = { ...(previous || {}) };
     delete previousWithoutManualReview.manualReview;
     const rawResponse = JSON.stringify({
@@ -1634,8 +1823,8 @@ app.post('/api/webhooks/hackerrank', async (req, res) => {
       providerAssessmentOutcome,
       assessmentOutcomeRecordedAt: providerAssessmentOutcome ? webhookAt.toISOString() : null,
       assessmentWorkflow: workflowMetadata,
-      completionTimestampSource: parseHackerRankTimestamp(candidate) ? 'HackerRank' : (status === 'Completed' && !exam.completedAt ? 'TalentLens first confirmed completion from webhook' : previous?.completionTimestampSource ?? null),
-      completionConfirmedAt: status === 'Completed' && !parseHackerRankTimestamp(candidate) ? finalCompletedAt?.toISOString() : previous?.completionConfirmedAt ?? null,
+      completionTimestampSource: status === 'Completed' && providerCompletedAt ? 'HackerRank' : null,
+      completionConfirmedAt: status === 'Completed' && providerCompletedAt ? providerCompletedAt.toISOString() : null,
       candidate,
       webhookReceivedAt: webhookAt.toISOString(),
     });
@@ -1689,7 +1878,7 @@ app.post('/api/employees/:id/chakra/prepare', authenticateUser, async (req: Auth
   const empId = Number(req.params.id);
   const invitationUrl = process.env.CHAKRA_INTERVIEW_URL?.trim() || '';
   if (!isHttpsUrl(invitationUrl)) {
-    return res.status(503).json({
+    return res.status(400).json({
       error: 'Chakra interview link is not configured. Copy the shareable link from Chakra > My Interviewers > Invite candidates and set CHAKRA_INTERVIEW_URL in the project-root .env. No invitation was sent.',
     });
   }
@@ -1722,7 +1911,7 @@ app.post('/api/employees/:id/chakra/confirm-invitation', authenticateUser, async
   }
   const empId = Number(req.params.id);
   const invitationUrl = process.env.CHAKRA_INTERVIEW_URL?.trim() || '';
-  if (!isHttpsUrl(invitationUrl)) return res.status(503).json({ error: 'Chakra invitation URL is not configured.' });
+  if (!isHttpsUrl(invitationUrl)) return res.status(400).json({ error: 'Chakra invitation URL is not configured.' });
   try {
     const empRecord = await db.select().from(employees).where(eq(employees.id, empId)).limit(1);
     if (!empRecord.length) return res.status(404).json({ error: 'Employee not found' });
@@ -1862,7 +2051,7 @@ app.post('/api/employees/:id/chakra/sync/:interviewId', authenticateUser, async 
   const authHeader = process.env.CHAKRA_API_AUTH_HEADER?.trim() || '';
   const authPrefix = process.env.CHAKRA_API_AUTH_PREFIX ?? '';
   if (!urlTemplate || !apiToken || !authHeader) {
-    return res.status(503).json({ error: 'Chakra API sync is not configured. Obtain the exact result endpoint and auth format from your Chakra workspace/HackerRank Support, then set CHAKRA_API_RESULTS_URL_TEMPLATE, CHAKRA_API_AUTH_HEADER, CHAKRA_API_AUTH_PREFIX, and CHAKRA_API_TOKEN. Alternatively import the official Chakra candidate-report CSV. No result was changed.' });
+    return res.status(400).json({ error: 'Chakra API sync is not configured. Obtain the exact result endpoint and auth format from your Chakra workspace/HackerRank Support, then set CHAKRA_API_RESULTS_URL_TEMPLATE, CHAKRA_API_AUTH_HEADER, CHAKRA_API_AUTH_PREFIX, and CHAKRA_API_TOKEN. Alternatively import the official Chakra candidate-report CSV. No result was changed.' });
   }
   try {
     const empRows = await db.select().from(employees).where(eq(employees.id, empId)).limit(1);
@@ -1873,22 +2062,22 @@ app.post('/api/employees/:id/chakra/sync/:interviewId', authenticateUser, async 
     const interview = records[0]; const email = normalizeChakraEmail(empRows[0].email);
     const finalUrl = urlTemplate.replaceAll('{interviewerId}', encodeURIComponent(interview.interviewerId)).replaceAll('{email}', encodeURIComponent(email));
     let parsedUrl: URL;
-    try { parsedUrl = new URL(finalUrl); } catch { return res.status(503).json({ error: 'Configured Chakra results URL template is not a valid absolute URL. No result was changed.' }); }
-    if (parsedUrl.protocol !== 'https:') return res.status(503).json({ error: 'The configured Chakra result URL must use HTTPS. No result was changed.' });
+    try { parsedUrl = new URL(finalUrl); } catch { return res.status(400).json({ error: 'Configured Chakra results URL template is not a valid absolute URL. No result was changed.' }); }
+    if (parsedUrl.protocol !== 'https:') return res.status(400).json({ error: 'The configured Chakra result URL must use HTTPS. No result was changed.' });
     const apiHost = parsedUrl.hostname.toLowerCase();
     if (apiHost !== 'hackerrank.com' && !apiHost.endsWith('.hackerrank.com')) {
-      return res.status(503).json({ error: 'The Chakra result endpoint must use an official hackerrank.com host so the API token cannot be sent to an unrelated domain. No result was changed.' });
+      return res.status(400).json({ error: 'The Chakra result endpoint must use an official hackerrank.com host so the API token cannot be sent to an unrelated domain. No result was changed.' });
     }
     if (urlTemplate.includes('{interviewerId}') && !process.env.CHAKRA_INTERVIEWER_ID?.trim()) {
-      return res.status(503).json({ error: 'The configured results URL needs {interviewerId}, but CHAKRA_INTERVIEWER_ID is empty. No result was changed.' });
+      return res.status(400).json({ error: 'The configured results URL needs {interviewerId}, but CHAKRA_INTERVIEWER_ID is empty. No result was changed.' });
     }
     const headers: Record<string, string> = { Accept: 'application/json' };
     headers[authHeader] = authPrefix.trim() ? `${authPrefix.trim()} ${apiToken}` : apiToken;
     const response = await fetch(parsedUrl.toString(), { method: 'GET', headers });
     const body = await response.text(); let payload: any;
     try { payload = body ? JSON.parse(body) : {}; }
-    catch { return res.status(502).json({ error: `Configured Chakra API returned non-JSON content (HTTP ${response.status}). Verify the official URL/auth settings. No result was changed.` }); }
-    if (!response.ok) return res.status(502).json({ error: `Configured Chakra API returned HTTP ${response.status}. Verify endpoint, token, permissions and auth format. No result was changed.` });
+    catch { return res.status(400).json({ error: `Configured Chakra API returned non-JSON content (HTTP ${response.status}). Verify the official URL/auth settings. No result was changed.` }); }
+    if (!response.ok) return res.status(400).json({ error: `Configured Chakra API returned HTTP ${response.status}. Verify endpoint, token, permissions and auth format. No result was changed.` });
     const match = collectChakraJsonObjects(payload).find(row => chakraRowEmail(row) === email);
     if (!match) return res.status(404).json({ error: `API response had no exact candidate-email match for ${email}. No result was changed.` });
     const nestedPayload = [match.candidate, match.interview, match.report, match.result, match.data].find(value => value && typeof value === 'object');
@@ -1901,13 +2090,39 @@ app.post('/api/employees/:id/chakra/sync/:interviewId', authenticateUser, async 
     const completedRaw = firstChakraValue(candidate, ['completed_at', 'completedAt', 'finished_at', 'finishedAt', 'submitted_at', 'submittedAt', 'completion_date', 'completionDate']);
     const completedDate = completedRaw ? new Date(completedRaw) : null;
     const reportRaw = firstChakraValue(candidate, ['report_url', 'reportUrl', 'candidate_report_url', 'candidateReportUrl', 'url']);
-    const updates: any = { rawResponse: JSON.stringify({ source: 'Chakra API', syncedAt: new Date().toISOString(), payload: candidate }) };
-    if (status) updates.status = status;
-    if (score !== undefined) updates.score = score;
-    if (typeof rec === 'string' && rec.trim()) updates.recommendation = rec.trim();
-    if (completedDate && !Number.isNaN(completedDate.getTime())) updates.completedAt = completedDate;
+    let storedRaw: any = {};
+    try { storedRaw = interview.rawResponse ? JSON.parse(interview.rawResponse) : {}; } catch {}
+
+    const incomingStatus = status || interview.status;
+    // Status protection: do not downgrade Completed to Invited from a partial sync response
+    const finalStatus = (String(interview.status).toLowerCase() === 'completed' && String(incomingStatus).toLowerCase() !== 'completed')
+      ? interview.status
+      : incomingStatus;
+
+    // Score protection: preserve existing valid score if API omitted it
+    const finalScore = score !== undefined ? score : interview.score;
+    const finalRec = typeof rec === 'string' && rec.trim() ? rec.trim() : interview.recommendation;
+
+    const isFinalCompleted = String(finalStatus).toLowerCase() === 'completed';
+    const finalCompletedAt = isFinalCompleted
+      ? (completedDate && !Number.isNaN(completedDate.getTime()) ? completedDate : interview.completedAt)
+      : null;
+
+    const updates: any = {
+      status: finalStatus,
+      score: finalScore,
+      recommendation: finalRec,
+      completedAt: finalCompletedAt,
+      rawResponse: JSON.stringify({
+        ...storedRaw,
+        source: 'Chakra API',
+        syncedAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+        payload: candidate,
+      }),
+    };
     if (isHttpsUrl(reportRaw)) updates.reportUrl = reportRaw;
-    if (Object.keys(updates).length === 1) return res.status(422).json({ error: 'A candidate matched, but the response has no recognizable result fields. Configure field mappings according to HackerRank documentation. No result values were changed.' });
+
     const updated = await db.update(chakraInterviews).set(updates).where(eq(chakraInterviews.id, interviewId)).returning();
     return res.json(updated[0]);
   } catch (error: any) {
@@ -1947,13 +2162,37 @@ app.post('/api/employees/:id/chakra/import-csv/:interviewId', authenticateUser, 
     const completedRaw = chakraCsvField(csvRow, ['completed at', 'completion date', 'finished at', 'submitted at', 'completed date', 'finished date']);
     const completedDate = completedRaw ? new Date(completedRaw) : null;
     const reportRaw = chakraCsvField(csvRow, ['report url', 'candidate report url', 'report link', 'candidate report', 'report']);
-    const updates: any = { rawResponse: JSON.stringify({ source: 'Chakra official report CSV', importedAt: new Date().toISOString(), row: csvRow }) };
-    if (status) updates.status = status;
-    if (score !== undefined) updates.score = score;
-    if (rec) updates.recommendation = rec;
-    if (completedDate && !Number.isNaN(completedDate.getTime())) updates.completedAt = completedDate;
+    let storedRaw: any = {};
+    try { storedRaw = records[0].rawResponse ? JSON.parse(records[0].rawResponse) : {}; } catch {}
+
+    const incomingStatus = status || records[0].status;
+    const finalStatus = (String(records[0].status).toLowerCase() === 'completed' && String(incomingStatus).toLowerCase() !== 'completed')
+      ? records[0].status
+      : incomingStatus;
+
+    const finalScore = score !== undefined ? score : records[0].score;
+    const finalRec = rec || records[0].recommendation;
+
+    const isFinalCompleted = String(finalStatus).toLowerCase() === 'completed';
+    const finalCompletedAt = isFinalCompleted
+      ? (completedDate && !Number.isNaN(completedDate.getTime()) ? completedDate : records[0].completedAt)
+      : null;
+
+    const updates: any = {
+      status: finalStatus,
+      score: finalScore,
+      recommendation: finalRec,
+      completedAt: finalCompletedAt,
+      rawResponse: JSON.stringify({
+        ...storedRaw,
+        source: 'Chakra official report CSV',
+        importedAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+        row: csvRow,
+      }),
+    };
     if (isHttpsUrl(reportRaw)) updates.reportUrl = reportRaw;
-    if (Object.keys(updates).length === 1) return res.status(422).json({ error: 'The matched CSV row did not have recognizable result fields. No result values were changed.' });
+
     const updated = await db.update(chakraInterviews).set(updates).where(eq(chakraInterviews.id, interviewId)).returning();
     return res.json(updated[0]);
   } catch (error: any) {
@@ -2315,25 +2554,22 @@ app.post('/api/employees/:id/sessions', authenticateUser, async (req: AuthReques
   }
 });
 
-// Dashboard Statistics Overview
+// Dashboard Statistics Overview (Company-wide aggregate statistics across Admin, Manager, and Mentor)
 app.get(['/api/dashboard-stats', '/api/dashboard/stats'], authenticateUser, async (req: AuthRequest, res) => {
   try {
-    let enriched = await getEnrichedEmployees();
+    const enriched = await getEnrichedEmployees();
 
-    if (req.user?.role === 'mentor') {
-      const mentorRecs = await db.select().from(mentors).where(eq(mentors.email, req.user.email)).limit(1);
-      const mentorName = mentorRecs.length > 0 ? mentorRecs[0].name : req.user.name;
-      enriched = enriched.filter(e => e.assignedMentor === mentorName);
-    }
-
-    // Compute metrics
-    const totalBench = enriched.filter(e => e.employeeType === 'Bench' && e.status !== 'Allocated').length;
+    // Compute company-wide metrics
+    const benchEmployees = enriched.filter(e => e.employeeType === 'Bench' && e.status !== 'Allocated');
+    const enrolledEmployees = benchEmployees.filter(e => e.status === 'In Training' || !!e.programEnrollmentDate);
+    const idleEmployees = benchEmployees.filter(e => !(e.status === 'In Training' || !!e.programEnrollmentDate));
+    const clientReadyBench = enrolledEmployees.filter(e => e.classificationTier === 'Client Ready' || e.status === 'Interview Ready');
     const deployedCount = enriched.filter(e => e.status === 'Allocated').length;
     const totalNewJoiners = enriched.filter(e => e.employeeType === 'New Joiner').length;
     const totalLaterals = enriched.filter(e => e.employeeType === 'Lateral Entry').length;
-    const interviewReady = enriched.filter(e => e.status === 'Interview Ready' || e.classificationTier === 'Client Ready').length;
+    const interviewReady = clientReadyBench.length;
     const needsSupportCount = enriched.filter(e => e.classificationTier === 'Needs Support').length;
-    const benchAlertsCount = enriched.filter(e => e.weeksEnrolled > 12 && e.classificationTier !== 'Client Ready').length;
+    const benchAlertsCount = enriched.filter(e => (e.weeksEnrolled || 0) > 12 && e.classificationTier !== 'Client Ready').length;
 
     // Top 10 Performers Leaderboard
     const leaderboard = [...enriched]
@@ -2399,13 +2635,16 @@ app.get(['/api/dashboard-stats', '/api/dashboard/stats'], authenticateUser, asyn
       stats: {
         overview: {
           totalEmployees: enriched.length,
-          totalBench,
+          totalBench: benchEmployees.length,
           totalNewJoiners,
           totalLaterals,
           interviewReady,
           needsSupport: needsSupportCount,
           benchAlerts: benchAlertsCount,
           deployed: deployedCount,
+          enrolled: enrolledEmployees.length,
+          idle: idleEmployees.length,
+          clientReady: clientReadyBench.length,
         },
         skillStrength,
         leaderboard,
@@ -2416,6 +2655,46 @@ app.get(['/api/dashboard-stats', '/api/dashboard/stats'], authenticateUser, asyn
   } catch (error) {
     console.error('Error fetching dashboard stats:', error);
     res.status(500).json({ error: 'Failed to fetch dashboard statistics', message: 'Failed to fetch dashboard statistics' });
+  }
+});
+
+// Assessment path selection: recruiter configures required assessment path (HackerRank, Chakra, Both, or Skip with audit)
+app.post('/api/employees/:id/assessment-path', authenticateUser, async (req: AuthRequest, res) => {
+  if (req.user?.role !== 'admin' && req.user?.role !== 'manager') {
+    return res.status(403).json({ error: 'Only admins and managers can change the assessment path.' });
+  }
+  const empId = Number(req.params.id);
+  const { assessmentPath } = req.body || {};
+  const reason = req.body?.reason || req.body?.skipReason || '';
+  if (!['hackerrank', 'chakra', 'both', 'skip'].includes(assessmentPath)) {
+    return res.status(400).json({ error: 'assessmentPath must be one of: hackerrank, chakra, both, skip' });
+  }
+  if (assessmentPath === 'skip' && (!reason || !String(reason).trim())) {
+    return res.status(400).json({ error: 'A justification reason is required when bypassing / skipping assessments.' });
+  }
+
+  try {
+    const empRows = await db.select().from(employees).where(eq(employees.id, empId)).limit(1);
+    if (!empRows.length) return res.status(404).json({ error: 'Employee not found.' });
+    const emp = empRows[0];
+    const { projectHistory } = parseEmployeeAssessmentSettings(emp.previousProjectHistory);
+    const skipAudit = assessmentPath === 'skip' ? {
+      skippedBy: req.user?.email || req.user?.name || 'Administrator',
+      skippedAt: new Date().toISOString(),
+      reason: String(reason).trim(),
+    } : null;
+
+    const serialized = serializeEmployeeAssessmentSettings(projectHistory, assessmentPath, skipAudit);
+    await db.update(employees).set({ previousProjectHistory: serialized }).where(eq(employees.id, empId));
+
+    console.log(`[AUDIT] Assessment path for employee ${empId} set to '${assessmentPath}' by ${req.user?.email || 'admin'}. ${skipAudit ? `Reason: ${skipAudit.reason}` : ''}`);
+
+    const enriched = await getEnrichedEmployees();
+    const updated = enriched.find(e => e.id === empId);
+    return res.json(updated);
+  } catch (error: any) {
+    console.error('Failed to update assessment path:', error);
+    return res.status(500).json({ error: 'Failed to update assessment path.' });
   }
 });
 
@@ -2430,10 +2709,43 @@ app.post('/api/employees/:id/mark-interview-ready', authenticateUser, async (req
     return res.status(400).json({ error: 'Status must be Enrolled or Interview Ready.' });
   }
   try {
-    const updated = await db.update(employees).set({ status: requestedStatus }).where(eq(employees.id, empId)).returning();
-    if (!updated.length) return res.status(404).json({ error: 'Employee not found.' });
-    console.log(`[AUDIT] Employee ${empId} status set to ${requestedStatus} by ${req.user?.email || req.user?.name || 'Admin'}.`);
-    return res.json(updated[0]);
+    const empRows = await db.select().from(employees).where(eq(employees.id, empId)).limit(1);
+    if (!empRows.length) return res.status(404).json({ error: 'Employee not found.' });
+    const emp = empRows[0];
+    const empExams = await db.select().from(hackerrankExams).where(eq(hackerrankExams.employeeId, empId));
+    const empChakra = await db.select().from(chakraInterviews).where(eq(chakraInterviews.employeeId, empId));
+    const readinessEval = evaluateCandidateReadiness(emp, empExams, empChakra);
+
+    if (requestedStatus === 'Interview Ready' && !readinessEval.canMarkReady) {
+      const forceOverride = req.body?.forceOverride === true;
+      const isAdmin = req.user?.role === 'admin';
+      const reason = String(req.body?.reason || req.body?.skipReason || '').trim();
+      if (forceOverride && isAdmin && reason) {
+        // Record skip audit trail
+        const { projectHistory } = parseEmployeeAssessmentSettings(emp.previousProjectHistory);
+        const skipAudit = {
+          skippedBy: req.user?.email || req.user?.name || 'Administrator',
+          skippedAt: new Date().toISOString(),
+          reason,
+        };
+        const serialized = serializeEmployeeAssessmentSettings(projectHistory, 'skip', skipAudit);
+        await db.update(employees).set({ status: 'Interview Ready', previousProjectHistory: serialized }).where(eq(employees.id, empId));
+        console.log(`[AUDIT] Admin override: employee ${empId} marked Interview Ready by ${req.user?.email}. Reason: ${reason}`);
+      } else {
+        return res.status(400).json({
+          error: `Cannot mark as Ready for Interview: ${readinessEval.reasons.join(' ')}`,
+          readiness: readinessEval.readiness,
+          reasons: readinessEval.reasons,
+        });
+      }
+    } else {
+      await db.update(employees).set({ status: requestedStatus }).where(eq(employees.id, empId));
+      console.log(`[AUDIT] Employee ${empId} status set to ${requestedStatus} by ${req.user?.email || req.user?.name || 'Admin'}.`);
+    }
+
+    const enriched = await getEnrichedEmployees();
+    const updated = enriched.find(e => e.id === empId);
+    return res.json(updated);
   } catch (error: any) {
     console.error('Failed to update candidate interview status:', error.message || error);
     return res.status(500).json({ error: `Could not update candidate status: ${error.message || 'Unexpected server error.'}` });
@@ -2549,65 +2861,29 @@ app.post('/api/reseed-from-excel', authenticateUser, async (req: AuthRequest, re
 // ==========================================
 
 async function seedDatabaseIfEmpty() {
-  try {
-    // Never force a fresh seed on restart: doing so would erase changes and assessment history.
-    const existingEmployees = await db.select({ id: employees.id }).from(employees).limit(1);
-    if (existingEmployees.length > 0) {
-      console.log('[Seed] Existing PostgreSQL data detected; skipping automatic Excel reseed.');
-      return;
-    }
+  // In production runtime or when an external database is configured, skip automatic boot seeding by default.
+  // Stage A administrative script (npm run db:admin:init) handles production seeding.
+  if ((process.env.NODE_ENV === 'production' || process.env.DATABASE_URL) && process.env.DB_AUTO_SEED !== 'true') {
+    console.log('[Seed] Database initialization bypassed: using existing configured database.');
+    return;
+  }
 
-    console.log('[Seed] No employee records found. Importing initial demo data from Excel once...');
-    await seedFromExcelFiles(false);
-    const seededEmployees = await db.select({ id: employees.id }).from(employees).limit(1);
-    if (seededEmployees.length === 0) {
-      console.warn('[Seed] No employee records were imported. Check Excel seed status and source files.');
-    }
-  } catch (error) {
-    console.error('[Seed] Failed to initialize initial demo data:', error);
-    throw error;
+  try {
+    // Seed mentors and employees independently; inserts missing records only with ON CONFLICT DO NOTHING
+    await seedMentorsFromExcel();
+    await seedEmployeesFromExcel();
+  } catch (error: any) {
+    console.error('[Seed] Notice: Background seed encountered an issue:', error.message);
   }
 }
 
 async function ensureDemoTestCandidate() {
-  // Add the requested local demo candidate only if neither email nor employee ID exists.
-  // This does not create a HackerRank attempt or send an invitation.
-  const existingEmployees = await db.select().from(employees);
-  const demoEmail = 'kshitijmankar06@gmail.com';
-  const demoEmployeeId = 'KSHITIJ-TEST';
-  const existing = existingEmployees.find((employee: any) =>
-    String(employee.email || '').toLowerCase() === demoEmail ||
-    String(employee.employeeId || '').toUpperCase() === demoEmployeeId
-  );
-  if (existing) return;
-
-  await db.insert(employees).values({
-    employeeId: demoEmployeeId,
-    name: 'Kshitij Mankar',
-    email: demoEmail,
-    joiningDate: '2026-10-12',
-    designation: 'Consultant',
-    employeeType: 'Bench',
-    status: 'Enrolled',
-    skillGroup: 'Data Engineering',
-    persona: 'Data Engineer',
-    skills: JSON.stringify(['Python', 'SQL', 'Spark', 'PySpark']),
-    benchAgingDays: 0,
-    yearsOfExperience: 5,
-    previousProjectHistory: '',
-    assignedMentor: null,
-    currentProject: 'Bench',
-    pythonLevel: 'Intermediate',
-    sqlLevel: 'Intermediate',
-    sparkLevel: 'Intermediate',
-    pysparkLevel: 'Beginner',
-    programEnrollmentDate: '2026-10-12',
-    location: 'Bengaluru',
-    module: 'Data Engineering',
-    secondaryModule: null,
-    excelSourceActive: false,
-  });
-  console.log('[Seed] Added local demo candidate KSHITIJ-TEST. No HackerRank invitation was sent.');
+  // Demo candidate is maintained separately from the 100 Excel employees.
+  // In production or when an external database is configured, demo candidate creation is disabled by default.
+  if ((process.env.NODE_ENV === 'production' || process.env.DATABASE_URL) && process.env.ENABLE_DEMO_SEED !== 'true') {
+    return;
+  }
+  await seedDemoCandidate();
 }
 
 async function startServer() {
@@ -2632,8 +2908,19 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  server.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE' && PORT !== DEFAULT_PORT) {
+      console.warn(`[Server] Port ${PORT} is already in use; falling back to port ${DEFAULT_PORT}...`);
+      app.listen(DEFAULT_PORT, '0.0.0.0', () => {
+        console.log(`Server running on http://0.0.0.0:${DEFAULT_PORT}`);
+      });
+    } else {
+      throw err;
+    }
   });
 }
 

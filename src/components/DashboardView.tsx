@@ -230,11 +230,11 @@ export default function DashboardView({
   const deployedBench = employees.filter(e => e.status === 'Allocated');
 
   const tabCounts = {
-    bench_total: benchEmployees.length,
-    enrolled: enrolledEmployees.length,
-    idle: idleEmployees.length,
-    client_ready: clientReadyBench.length,
-    deployed: deployedBench.length
+    bench_total: stats?.overview?.totalBench ?? benchEmployees.length,
+    enrolled: stats?.overview?.enrolled ?? enrolledEmployees.length,
+    idle: stats?.overview?.idle ?? idleEmployees.length,
+    client_ready: stats?.overview?.clientReady ?? (stats?.overview?.interviewReady ?? clientReadyBench.length),
+    deployed: stats?.overview?.deployed ?? deployedBench.length
   };
 
   // Base list of employees for the active tab (before Excel column filters and search queries)
